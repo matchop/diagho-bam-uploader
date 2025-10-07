@@ -58,7 +58,6 @@ class APIClient:
     # Token handling
     # ---------------------------
     def _token_path(self):
-        print(f"token path: {self.token_file}")
         return os.path.abspath(self.token_file)
 
     def _save_token(self):
@@ -122,40 +121,82 @@ class APIClient:
 # Watcher logic
 # ---------------------------
 class FlagFileHandler(FileSystemEventHandler):
-    def __init__(self, client, watch_root):
+    def __init__(self, client, watch_root, flag_suffix=".done", quiescent_check=False, quiet_period=10):
+        """
+        :param client: APIClient instance
+        :param watch_root: Root directory to watch
+        :param flag_suffix: Expected suffix for flag files (default: .done)
+        :param quiescent_check: If True, will verify no file in dir changed recently before upload
+        :param quiet_period: Seconds of inactivity before considering directory stable
+        """
         self.client = client
         self.watch_root = Path(watch_root)
+        self.flag_suffix = flag_suffix
+        self.quiescent_check = quiescent_check
+        self.quiet_period = quiet_period
 
     def on_created(self, event):
         if event.is_directory:
             return
-        if event.src_path.endswith("FLAG"):
-            flag_path = Path(event.src_path)
-            subdir = flag_path.parent
-            logger.info(f"Detected FLAG in {subdir}")
-            self.process_directory(subdir)
+        path = Path(event.src_path)
 
-    def process_directory(self, subdir):
-        run_name = subdir.name
+        # Only trigger if it's a flag file (e.g. upload.done)
+        if path.name.endswith(self.flag_suffix):
+            logger.info(f"Detected flag file: {path}")
+            self._handle_flag(path)
+
+    def _handle_flag(self, flag_path):
+        """Process a completed run once the flag file appears."""
+        # Parent directory of the flag file
+        run_dir = flag_path.parent
+        run_name = run_dir.name
+
+        logger.info(f"Preparing to process run: {run_name}")
+
+        # Ensure authentication is valid
+        if not self.client._is_token_valid():
+            logger.warning("Token invalid, reauthenticating before upload...")
+            self.client.authenticate()
+            self.client._save_token()
+
+        # Optional check: ensure directory isn't still being modified
+        if self.quiescent_check:
+            logger.info(f"Waiting for directory {run_dir} to be stable...")
+            while not self._is_directory_quiescent(run_dir):
+                time.sleep(self.quiet_period)
+
+        # Create a new run on the server
+        logger.info(f"Creating run in API: {run_name}")
         run = self.client.create_run(run_name)
         run_id = run.get("id")
-        logger.info(f"Created run {run_name} (ID {run_id})")
+        logger.info(f"Run created: {run_name} (ID={run_id})")
 
-        for file in subdir.iterdir():
-            if file.is_file() and not file.name.endswith("FLAG"):
-                logger.info(f"Uploading file: {file}")
-                self.client.upload_file(run_id, file)
+        # Upload files from subdirectories
+        for sub in run_dir.iterdir():
+            if sub.is_dir():
+                self._upload_subdir(sub, run_id)
+            elif sub.is_file() and sub.name != flag_path.name:
+                logger.info(f"Uploading root-level file: {sub}")
+                self.client.upload_file(run_id, sub)
 
-        # Example of processing a zipped file
-        zip_file = subdir / "special_content.zip"
-        if zip_file.exists():
-            extract_dir = subdir / "extracted"
-            extract_dir.mkdir(exist_ok=True)
-            with zipfile.ZipFile(zip_file, 'r') as zip_ref:
-                zip_ref.extractall(extract_dir)
-            for f in extract_dir.iterdir():
-                logger.info(f"Uploading extracted file: {f}")
-                self.client.upload_file(run_id, f)
+        logger.info(f"Completed processing of run {run_name}")
+
+    def _upload_subdir(self, subdir, run_id):
+        logger.info(f"Uploading files from {subdir}")
+        for file in subdir.rglob('*'):
+            if file.is_file():
+                try:
+                    logger.info(f"Uploading file: {file}")
+                    self.client.upload_file(run_id, file)
+                except Exception as e:
+                    logger.error(f"Failed to upload {file}: {e}")
+
+    def _is_directory_quiescent(self, path):
+        """Check if no file has been modified recently."""
+        latest_mtime = max(f.stat().st_mtime for f in Path(path).rglob('*') if f.is_file())
+        age = time.time() - latest_mtime
+        return age > self.quiet_period
+
 
 # ---------------------------
 # Entry point
@@ -168,21 +209,27 @@ def main():
     watch_path = config["WATCH"]["path"]
 
     client = APIClient(base_url, identifier, password)
-    # client.authenticate()
 
-    # event_handler = FlagFileHandler(client, watch_path)
-    # observer = Observer()
-    # observer.schedule(event_handler, watch_path, recursive=True)
-    # observer.start()
+    event_handler = FlagFileHandler(
+        client,
+        watch_path,
+        flag_suffix=".done",         # looks for "upload.done" or similar
+        quiescent_check=False,       # you can enable it later if needed
+        quiet_period=10
+    )
+
+    observer = Observer()
+    observer.schedule(event_handler, watch_path, recursive=True)
+    observer.start()
 
     logger.info(f"Watching {watch_path} for FLAG files...")
 
-    # try:
-    #     while True:
-    #         time.sleep(1)
-    # except KeyboardInterrupt:
-    #     observer.stop()
-    # observer.join()
+    try:
+        while True:
+            time.sleep(1)
+    except KeyboardInterrupt:
+        observer.stop()
+    observer.join()
 
 if __name__ == "__main__":
     main()
