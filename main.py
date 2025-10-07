@@ -43,7 +43,6 @@ class APIClient:
         self.password = password
         self.token = None
         self.token_file = token_file
-        self.token = None
 
         # Try loading a stored token first
         self._load_token()
@@ -118,6 +117,22 @@ class APIClient:
         response = requests.post(url, files=files, headers=self._headers())
         response.raise_for_status()
         return response.json()
+    
+    def search_sample(self, query):
+        """Search for a sample by query string."""
+        url = f"{self.base_url}/samples/"
+        params = {"search": query}
+        r = requests.get(url, headers=self._headers(), params=params)
+        if r.status_code == 200:
+            return r.json().get("results", [])
+        return []
+
+    def patch_sample(self, sample_id, data):
+        """Patch a specific sample."""
+        url = f"{self.base_url}/samples/{sample_id}/"
+        r = requests.patch(url, json=data, headers=self._headers())
+        r.raise_for_status()
+        return r.json()
 
 # ---------------------------
 # Watcher logic
@@ -125,7 +140,7 @@ class APIClient:
 class FlagFileHandler(FileSystemEventHandler):
     def __init__(self, client, watch_root, flag_suffix=".done", quiescent_check=False, quiet_period=10,
         backup_root=None,
-        retention_days=7):
+        retention_days=7, retry_delay_min=10, enable_bam_linking=True):
         """
         :param client: APIClient instance
         :param watch_root: Root directory to watch
@@ -142,6 +157,8 @@ class FlagFileHandler(FileSystemEventHandler):
         self.retention_days = retention_days
         if self.backup_root:
             self.backup_root.mkdir(parents=True, exist_ok=True)
+        self.retry_delay_min = retry_delay_min
+        self.enable_bam_linking = enable_bam_linking
 
     def on_created(self, event):
         if event.is_directory:
@@ -197,6 +214,14 @@ class FlagFileHandler(FileSystemEventHandler):
             self._backup_run(run_dir)
             self._cleanup_old_backups()
 
+            # After backup, try linking BAMs to samples
+            if self.client and self.client.base_url and getattr(self, "enable_bam_linking", True):
+                self._link_bam_files_to_samples(
+                    self.backup_root / f"{run_dir.name}_{datetime.now().strftime('%Y%m%d_%H%M%S')}",
+                    run_id,
+                    retry_delay_min=self.retry_delay_min
+                )
+
         logger.info(f"Completed processing of run {run_name}")
 
     def _upload_bam_dir(self, bam_dir, run_id):
@@ -242,7 +267,7 @@ class FlagFileHandler(FileSystemEventHandler):
         return age > self.quiet_period
 
     # ---------------------------
-    # Token handling
+    # Housekeeping
     # ---------------------------
 
     def _backup_run(self, run_dir):
@@ -253,8 +278,10 @@ class FlagFileHandler(FileSystemEventHandler):
             logger.info(f"Moving {run_dir} → {dest_dir}")
             shutil.move(str(run_dir), str(dest_dir))
             logger.info(f"Backup complete for {run_dir.name}")
+            return dest_dir
         except Exception as e:
             logger.error(f"Failed to move {run_dir} to backup: {e}")
+            return None
 
     def _cleanup_old_backups(self):
         """Remove backup folders older than retention_days."""
@@ -275,6 +302,49 @@ class FlagFileHandler(FileSystemEventHandler):
             except Exception as e:
                 logger.error(f"Error cleaning {subdir}: {e}")
 
+    # ---------------------------
+    # Update BAM path
+    # ---------------------------
+    def _link_bam_files_to_samples(self, run_dir, run_id, retry_delay_min=10):
+        """After upload & backup, link BAM files to existing samples by patching bamPath."""
+        bam_dir = run_dir / "bam"
+        if not bam_dir.exists():
+            logger.info(f"No BAM directory in {run_dir}, skipping sample linking.")
+            return
+
+        bam_files = [f for f in bam_dir.iterdir() if f.is_file() and f.suffix == ".bam" and not f.name.endswith(".bam.bai")]
+        if not bam_files:
+            logger.info("No BAM files found for sample linking.")
+            return
+
+        for bam_file in bam_files:
+            person_id = bam_file.name.split('.')[0]
+            bam_url = f"{self.client.base_url}/media/uploads/bio_files/run/{run_id}/{bam_file.name}"
+            logger.info(f"Preparing to link BAM for {person_id} -> {bam_url}")
+
+            found = False
+            retries = 0
+            while not found:
+                results = self.client.search_sample(person_id)
+                if results:
+                    logger.info(f"Found {len(results)} samples for {person_id}")
+                    for sample in results:
+                        sid = sample.get("id")
+                        try:
+                            logger.info(f"Patching sample {sid} with bamPath")
+                            self.client.patch_sample(sid, {"bamPath": bam_url})
+                        except Exception as e:
+                            logger.error(f"Failed to patch sample {sid}: {e}")
+                    found = True
+                else:
+                    retries += 1
+                    delay = retry_delay_min * 60
+                    logger.warning(f"No samples found for {person_id}. Retry {retries} in {retry_delay_min} min...")
+                    time.sleep(delay)
+
+            logger.info(f"BAM linking complete for {person_id}")
+
+
 
 # ---------------------------
 # Entry point
@@ -289,6 +359,9 @@ def main():
     backup_root = config["HOUSEKEEPING"]["backup_path"]
     retention_days = int(config["HOUSEKEEPING"].get("retention_days", 7))
 
+    retry_delay_min = int(config["SAMPLES"].get("retry_delay_minutes", 10))
+    enable_bam_linking = config["SAMPLES"].getboolean("enable_bam_linking", True)
+
     client = APIClient(base_url, identifier, password)
 
     event_handler = FlagFileHandler(
@@ -298,7 +371,9 @@ def main():
         quiescent_check=False,
         quiet_period=10,
         backup_root=backup_root,
-        retention_days=retention_days
+        retention_days=retention_days,
+        retry_delay_min=retry_delay_min,
+        enable_bam_linking=enable_bam_linking
     )
 
     observer = Observer()
