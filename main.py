@@ -104,14 +104,14 @@ class APIClient:
         return {"Authorization": f"Bearer {self.token}"} if self.token else {}
 
     def create_run(self, run_name):
-        url = f"{self.base_url}/runs"
-        payload = {"name": run_name}
+        url = f"{self.base_url}/runs/"
+        payload = {"runName": run_name}
         response = requests.post(url, json=payload, headers=self._headers())
         response.raise_for_status()
         return response.json()
 
     def upload_file(self, run_id, file_path):
-        url = f"{self.base_url}/runs/{run_id}/attachments"
+        url = f"{self.base_url}/runs/{run_id}/files/"
         files = {"file": open(file_path, "rb")}
         response = requests.post(url, files=files, headers=self._headers())
         response.raise_for_status()
@@ -150,8 +150,7 @@ class FlagFileHandler(FileSystemEventHandler):
         # Parent directory of the flag file
         run_dir = flag_path.parent
         run_name = run_dir.name
-
-        logger.info(f"Preparing to process run: {run_name}")
+        logger.info(f"Processing run: {run_name}")
 
         # Ensure authentication is valid
         if not self.client._is_token_valid():
@@ -171,25 +170,57 @@ class FlagFileHandler(FileSystemEventHandler):
         run_id = run.get("id")
         logger.info(f"Run created: {run_name} (ID={run_id})")
 
-        # Upload files from subdirectories
-        for sub in run_dir.iterdir():
-            if sub.is_dir():
-                self._upload_subdir(sub, run_id)
-            elif sub.is_file() and sub.name != flag_path.name:
-                logger.info(f"Uploading root-level file: {sub}")
-                self.client.upload_file(run_id, sub)
+        # Expected folders
+        bam_dir = run_dir / "bam"
+        multiqc_dir = run_dir / "multiqc"
+
+        if bam_dir.exists():
+            self._upload_bam_dir(bam_dir, run_id)
+        else:
+            logger.warning(f"No 'bam' directory found in {run_dir}")
+
+        if multiqc_dir.exists():
+            self._upload_multiqc_dir(multiqc_dir, run_id)
+        else:
+            logger.warning(f"No 'multiqc' directory found in {run_dir}")
 
         logger.info(f"Completed processing of run {run_name}")
 
-    def _upload_subdir(self, subdir, run_id):
-        logger.info(f"Uploading files from {subdir}")
-        for file in subdir.rglob('*'):
-            if file.is_file():
-                try:
-                    logger.info(f"Uploading file: {file}")
-                    self.client.upload_file(run_id, file)
-                except Exception as e:
-                    logger.error(f"Failed to upload {file}: {e}")
+    def _upload_bam_dir(self, bam_dir, run_id):
+        """Upload BAM files sequentially."""
+        bam_files = sorted([f for f in bam_dir.iterdir() if f.is_file()])
+        logger.info(f"Found {len(bam_files)} BAM files to upload")
+
+        for bam_file in bam_files:
+            logger.info(f"Uploading BAM: {bam_file}")
+            try:
+                self.client.upload_file(run_id, bam_file)
+                logger.info(f"Uploaded BAM: {bam_file.name}")
+            except Exception as e:
+                logger.error(f"Failed to upload {bam_file}: {e}")
+            time.sleep(1)  # optional small pause to avoid overloading network/API
+
+    def _upload_multiqc_dir(self, multiqc_dir, run_id):
+        """Upload only ZIP files within multiqc (recursively)."""
+        zip_files = list(multiqc_dir.rglob("*.zip"))
+        logger.info(f"Found {len(zip_files)} MultiQC ZIP files to upload")
+
+        for zip_file in zip_files:
+            parent_name = zip_file.parent.name
+            new_name = f"{parent_name}_multiqc.zip"
+
+            logger.info(f"Uploading MultiQC ZIP: {zip_file} as {new_name}")
+            try:
+                with open(zip_file, "rb") as f:
+                    files = {"file": (new_name, f)}
+                    url = f"{self.client.base_url}/runs/{run_id}/files/"
+                    response = requests.post(url, files=files, headers=self.client._headers())
+                    response.raise_for_status()
+                    logger.info(f"Uploaded MultiQC ZIP as {new_name}")
+            except Exception as e:
+                logger.error(f"Failed to upload {zip_file}: {e}")
+
+            time.sleep(0.5)
 
     def _is_directory_quiescent(self, path):
         """Check if no file has been modified recently."""
@@ -213,8 +244,8 @@ def main():
     event_handler = FlagFileHandler(
         client,
         watch_path,
-        flag_suffix=".done",         # looks for "upload.done" or similar
-        quiescent_check=False,       # you can enable it later if needed
+        flag_suffix=".done",
+        quiescent_check=False,
         quiet_period=10
     )
 
