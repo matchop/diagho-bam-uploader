@@ -9,6 +9,8 @@ from pathlib import Path
 from watchdog.observers import Observer
 from watchdog.events import FileSystemEventHandler
 from configparser import ConfigParser
+import shutil
+from datetime import datetime, timedelta
 
 # ---------------------------
 # Setup logging
@@ -121,7 +123,9 @@ class APIClient:
 # Watcher logic
 # ---------------------------
 class FlagFileHandler(FileSystemEventHandler):
-    def __init__(self, client, watch_root, flag_suffix=".done", quiescent_check=False, quiet_period=10):
+    def __init__(self, client, watch_root, flag_suffix=".done", quiescent_check=False, quiet_period=10,
+        backup_root=None,
+        retention_days=7):
         """
         :param client: APIClient instance
         :param watch_root: Root directory to watch
@@ -134,6 +138,10 @@ class FlagFileHandler(FileSystemEventHandler):
         self.flag_suffix = flag_suffix
         self.quiescent_check = quiescent_check
         self.quiet_period = quiet_period
+        self.backup_root = Path(backup_root) if backup_root else None
+        self.retention_days = retention_days
+        if self.backup_root:
+            self.backup_root.mkdir(parents=True, exist_ok=True)
 
     def on_created(self, event):
         if event.is_directory:
@@ -184,6 +192,11 @@ class FlagFileHandler(FileSystemEventHandler):
         else:
             logger.warning(f"No 'multiqc' directory found in {run_dir}")
 
+        # Backup + cleanup
+        if self.backup_root:
+            self._backup_run(run_dir)
+            self._cleanup_old_backups()
+
         logger.info(f"Completed processing of run {run_name}")
 
     def _upload_bam_dir(self, bam_dir, run_id):
@@ -228,6 +241,40 @@ class FlagFileHandler(FileSystemEventHandler):
         age = time.time() - latest_mtime
         return age > self.quiet_period
 
+    # ---------------------------
+    # Token handling
+    # ---------------------------
+
+    def _backup_run(self, run_dir):
+        """Move successfully processed run directory to backup folder."""
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        dest_dir = self.backup_root / f"{run_dir.name}_{timestamp}"
+        try:
+            logger.info(f"Moving {run_dir} → {dest_dir}")
+            shutil.move(str(run_dir), str(dest_dir))
+            logger.info(f"Backup complete for {run_dir.name}")
+        except Exception as e:
+            logger.error(f"Failed to move {run_dir} to backup: {e}")
+
+    def _cleanup_old_backups(self):
+        """Remove backup folders older than retention_days."""
+        if not self.backup_root.exists():
+            return
+
+        cutoff = datetime.now() - timedelta(days=self.retention_days)
+        logger.info(f"Cleaning backups older than {self.retention_days} days")
+
+        for subdir in self.backup_root.iterdir():
+            if not subdir.is_dir():
+                continue
+            try:
+                mtime = datetime.fromtimestamp(subdir.stat().st_mtime)
+                if mtime < cutoff:
+                    logger.info(f"Deleting old backup: {subdir}")
+                    shutil.rmtree(subdir)
+            except Exception as e:
+                logger.error(f"Error cleaning {subdir}: {e}")
+
 
 # ---------------------------
 # Entry point
@@ -239,6 +286,9 @@ def main():
     password = config["API"]["password"]
     watch_path = config["WATCH"]["path"]
 
+    backup_root = config["HOUSEKEEPING"]["backup_path"]
+    retention_days = int(config["HOUSEKEEPING"].get("retention_days", 7))
+
     client = APIClient(base_url, identifier, password)
 
     event_handler = FlagFileHandler(
@@ -246,7 +296,9 @@ def main():
         watch_path,
         flag_suffix=".done",
         quiescent_check=False,
-        quiet_period=10
+        quiet_period=10,
+        backup_root=backup_root,
+        retention_days=retention_days
     )
 
     observer = Observer()
