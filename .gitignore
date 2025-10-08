@@ -2,3 +2,4 @@ venv
 .token
 *.log
 config.ini
+nohup.out

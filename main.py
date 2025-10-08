@@ -103,10 +103,31 @@ class APIClient:
 
     def _headers(self):
         return {"Authorization": f"Bearer {self.token}"} if self.token else {}
+    
+    def get_run_by_name(self, run_name):
+        """Fetch all runs (pageSize=0) and return the one matching run_name exactly."""
+        url = f"{self.base_url}/runs/?pageSize=0"
+        response = requests.get(url, headers=self._headers())
+        response.raise_for_status()
 
-    def create_run(self, run_name):
+        runs = response.json().get("results", [])
+        for run in runs:
+            if run.get("runName") == run_name:
+                logger.info(f"Found existing run: {run_name} (ID={run.get('id')})")
+                return run
+
+        logger.info(f"No existing run found with name {run_name}")
+        return None
+
+    def create_or_get_run(self, run_name):
+        """Return an existing run if it exists, otherwise create it."""
+        existing = self.get_run_by_name(run_name)
+        if existing:
+            return existing
+
         url = f"{self.base_url}/runs/"
         payload = {"runName": run_name}
+        logger.info(f"Creating new run {run_name}")
         response = requests.post(url, json=payload, headers=self._headers())
         response.raise_for_status()
         return response.json()
@@ -191,9 +212,9 @@ class FlagFileHandler(FileSystemEventHandler):
 
         # Create a new run on the server
         logger.info(f"Creating run in API: {run_name}")
-        run = self.client.create_run(run_name)
+        run = self.client.create_or_get_run(run_name)
         run_id = run.get("id")
-        logger.info(f"Run created: {run_name} (ID={run_id})")
+        logger.info(f"Using run: {run_name} (ID={run_id})")
 
         # Expected folders
         bam_dir = run_dir / "bam"
