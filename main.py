@@ -1,10 +1,8 @@
 #!/usr/bin/env python3
 import os
 import time
-import json
 import logging
 import requests
-import zipfile
 from pathlib import Path
 from watchdog.observers import Observer
 from watchdog.events import FileSystemEventHandler
@@ -233,7 +231,8 @@ class FlagFileHandler(FileSystemEventHandler):
         # Backup + cleanup
         if self.backup_root:
             self._backup_run(run_dir)
-            self._cleanup_old_backups()
+            # UNCOMMENT FOR AUTO CLEANUP OF ARCHIVES
+            # self._cleanup_old_backups()
 
             # After backup, try linking BAMs to samples
             if self.client and self.client.base_url and getattr(self, "enable_bam_linking", True):
