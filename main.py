@@ -104,6 +104,11 @@ class APIClient:
     
     def get_run_by_name(self, run_name):
         """Fetch all runs (pageSize=0) and return the one matching run_name exactly."""
+        if not self.client._is_token_valid():
+            logger.warning("Token invalid, reauthenticating before upload...")
+            self.client.authenticate()
+            self.client._save_token()
+        
         url = f"{self.base_url}/runs/?pageSize=0"
         response = requests.get(url, headers=self._headers())
         response.raise_for_status()
@@ -122,6 +127,11 @@ class APIClient:
         existing = self.get_run_by_name(run_name)
         if existing:
             return existing
+        
+        if not self.client._is_token_valid():
+            logger.warning("Token invalid, reauthenticating before upload...")
+            self.client.authenticate()
+            self.client._save_token()
 
         url = f"{self.base_url}/runs/"
         payload = {"runName": run_name}
@@ -131,6 +141,11 @@ class APIClient:
         return response.json()
 
     def upload_file(self, run_id, file_path):
+        if not self.client._is_token_valid():
+            logger.warning("Token invalid, reauthenticating before upload...")
+            self.client.authenticate()
+            self.client._save_token()
+    
         url = f"{self.base_url}/runs/{run_id}/files/"
         files = {"file": open(file_path, "rb")}
         response = requests.post(url, files=files, headers=self._headers())
@@ -139,6 +154,11 @@ class APIClient:
     
     def search_sample(self, query):
         """Search for a sample by query string."""
+        if not self.client._is_token_valid():
+            logger.warning("Token invalid, reauthenticating before upload...")
+            self.client.authenticate()
+            self.client._save_token()
+        
         url = f"{self.base_url}/samples/"
         params = {"search": query}
         r = requests.get(url, headers=self._headers(), params=params)
@@ -148,6 +168,11 @@ class APIClient:
 
     def patch_sample(self, sample_id, data):
         """Patch a specific sample."""
+        if not self.client._is_token_valid():
+            logger.warning("Token invalid, reauthenticating before upload...")
+            self.client.authenticate()
+            self.client._save_token()
+        
         url = f"{self.base_url}/samples/{sample_id}/"
         r = requests.patch(url, json=data, headers=self._headers())
         r.raise_for_status()
@@ -266,6 +291,11 @@ class FlagFileHandler(FileSystemEventHandler):
         for zip_file in zip_files:
             parent_name = zip_file.parent.name
             new_name = f"{parent_name}_multiqc.zip"
+
+            if not self.client._is_token_valid():
+                logger.warning("Token invalid, reauthenticating before upload...")
+                self.client.authenticate()
+                self.client._save_token()
 
             logger.info(f"Uploading MultiQC ZIP: {zip_file} as {new_name}")
             try:
