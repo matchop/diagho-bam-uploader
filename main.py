@@ -104,10 +104,10 @@ class APIClient:
     
     def get_run_by_name(self, run_name):
         """Fetch all runs (pageSize=0) and return the one matching run_name exactly."""
-        if not self.client._is_token_valid():
+        if not self._is_token_valid():
             logger.warning("Token invalid, reauthenticating before upload...")
-            self.client.authenticate()
-            self.client._save_token()
+            self.authenticate()
+            self._save_token()
         
         url = f"{self.base_url}/runs/?pageSize=0"
         response = requests.get(url, headers=self._headers())
@@ -128,10 +128,10 @@ class APIClient:
         if existing:
             return existing
         
-        if not self.client._is_token_valid():
+        if not self._is_token_valid():
             logger.warning("Token invalid, reauthenticating before upload...")
-            self.client.authenticate()
-            self.client._save_token()
+            self.authenticate()
+            self._save_token()
 
         url = f"{self.base_url}/runs/"
         payload = {"runName": run_name}
@@ -141,10 +141,10 @@ class APIClient:
         return response.json()
 
     def upload_file(self, run_id, file_path):
-        if not self.client._is_token_valid():
+        if not self._is_token_valid():
             logger.warning("Token invalid, reauthenticating before upload...")
-            self.client.authenticate()
-            self.client._save_token()
+            self.authenticate()
+            self._save_token()
     
         url = f"{self.base_url}/runs/{run_id}/files/"
         files = {"file": open(file_path, "rb")}
@@ -154,10 +154,10 @@ class APIClient:
     
     def search_sample(self, query):
         """Search for a sample by query string."""
-        if not self.client._is_token_valid():
+        if not self._is_token_valid():
             logger.warning("Token invalid, reauthenticating before upload...")
-            self.client.authenticate()
-            self.client._save_token()
+            self.authenticate()
+            self._save_token()
         
         url = f"{self.base_url}/samples/"
         params = {"search": query}
@@ -168,10 +168,10 @@ class APIClient:
 
     def patch_sample(self, sample_id, data):
         """Patch a specific sample."""
-        if not self.client._is_token_valid():
+        if not self._is_token_valid():
             logger.warning("Token invalid, reauthenticating before upload...")
-            self.client.authenticate()
-            self.client._save_token()
+            self.authenticate()
+            self._save_token()
         
         url = f"{self.base_url}/samples/{sample_id}/"
         r = requests.patch(url, json=data, headers=self._headers())
