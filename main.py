@@ -362,7 +362,7 @@ class FlagFileHandler(FileSystemEventHandler):
             logger.info(f"No BAM directory in {run_dir}, skipping sample linking.")
             return
 
-        bam_files = [f for f in bam_dir.iterdir() if f.is_file() and f.suffix == ".bam" and not f.name.endswith(".bam.bai")]
+        bam_files = [f for f in bam_dir.iterdir() if f.is_file() and f.suffix in (".bam", ".cram") and not f.name.endswith((".bam.bai", ".cram.crai"))]
         if not bam_files:
             logger.info("No BAM files found for sample linking.")
             return
