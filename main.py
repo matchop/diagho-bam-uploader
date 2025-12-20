@@ -369,7 +369,7 @@ class FlagFileHandler(FileSystemEventHandler):
 
         for bam_file in bam_files:
             person_id = bam_file.name.split('.')[0]
-            bam_url = f"{self.client.base_url}/media/uploads/bio_files/run/{run_id}/{bam_file.name}"
+            bam_url = f"{self.client.base_url.removesuffix("/api/v1")}/media/uploads/bio_files/run/{run_id}/{bam_file.name}"
             logger.info(f"Preparing to link BAM for {person_id} -> {bam_url}")
 
             found = False
