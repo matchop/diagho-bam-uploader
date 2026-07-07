@@ -122,23 +122,29 @@ class APIClient:
         logger.info(f"No existing run found with name {run_name}")
         return None
 
-    def create_or_get_run(self, run_name):
-        """Return an existing run if it exists, otherwise create it."""
-        existing = self.get_run_by_name(run_name)
-        if existing:
-            return existing
-        
-        if not self._is_token_valid():
-            logger.warning("Token invalid, reauthenticating before upload...")
-            self.authenticate()
-            self._save_token()
+    def get_run(self, run_name):
+        """Return an existing run, or None if it does not exist.
 
-        url = f"{self.base_url}/runs/"
-        payload = {"runName": run_name}
-        logger.info(f"Creating new run {run_name}")
-        response = requests.post(url, json=payload, headers=self._headers())
-        response.raise_for_status()
-        return response.json()
+        The bam-uploader must run only after diagho-uploader has finished, which
+        is what creates the run in the app. If the run does not exist yet, we do
+        NOT create it here so that bams are never uploaded before the samples are
+        in place; the caller stops instead.
+        """
+        return self.get_run_by_name(run_name)
+
+        # Run creation intentionally disabled. We rely on diagho-uploader having
+        # created the run; if it hasn't, we stop rather than create a premature run.
+        # if not self._is_token_valid():
+        #     logger.warning("Token invalid, reauthenticating before upload...")
+        #     self.authenticate()
+        #     self._save_token()
+        #
+        # url = f"{self.base_url}/runs/"
+        # payload = {"runName": run_name}
+        # logger.info(f"Creating new run {run_name}")
+        # response = requests.post(url, json=payload, headers=self._headers())
+        # response.raise_for_status()
+        # return response.json()
 
     def upload_file(self, run_id, file_path):
         if not self._is_token_valid():
@@ -184,7 +190,7 @@ class APIClient:
 class FlagFileHandler(FileSystemEventHandler):
     def __init__(self, client, watch_root, flag_suffix=".done", quiescent_check=False, quiet_period=10,
         backup_root=None,
-        retention_days=7, retry_delay_min=10, enable_bam_linking=True):
+        retention_days=7, retry_delay_min=10, enable_bam_linking=True, max_link_retries=3):
         """
         :param client: APIClient instance
         :param watch_root: Root directory to watch
@@ -203,6 +209,7 @@ class FlagFileHandler(FileSystemEventHandler):
             self.backup_root.mkdir(parents=True, exist_ok=True)
         self.retry_delay_min = retry_delay_min
         self.enable_bam_linking = enable_bam_linking
+        self.max_link_retries = max_link_retries
 
     def on_created(self, event):
         if event.is_directory:
@@ -233,9 +240,17 @@ class FlagFileHandler(FileSystemEventHandler):
             while not self._is_directory_quiescent(run_dir):
                 time.sleep(self.quiet_period)
 
-        # Create a new run on the server
-        logger.info(f"Creating run in API: {run_name}")
-        run = self.client.create_or_get_run(run_name)
+        # Look up the run on the server. It must already exist (created by
+        # diagho-uploader); if not, stop here instead of creating it.
+        logger.info(f"Looking up run in API: {run_name}")
+        run = self.client.get_run(run_name)
+        if not run:
+            logger.warning(
+                f"Run '{run_name}' not found in API; diagho-uploader may not have "
+                f"finished yet. Skipping upload (run will be retried when its flag "
+                f"file reappears)."
+            )
+            return
         run_id = run.get("id")
         logger.info(f"Using run: {run_name} (ID={run_id})")
 
@@ -253,6 +268,9 @@ class FlagFileHandler(FileSystemEventHandler):
         else:
             logger.warning(f"No 'multiqc' directory found in {run_dir}")
 
+        # Upload any other files sitting next to the flag (QC summaries, cnv files, ...)
+        self._upload_run_root_files(run_dir, run_id, flag_path)
+
         # Backup + cleanup
         if self.backup_root:
             self._backup_run(run_dir)
@@ -264,7 +282,8 @@ class FlagFileHandler(FileSystemEventHandler):
                 self._link_bam_files_to_samples(
                     self.backup_root / f"{run_dir.name}_{datetime.now().strftime('%Y%m%d_%H%M%S')}",
                     run_id,
-                    retry_delay_min=self.retry_delay_min
+                    retry_delay_min=self.retry_delay_min,
+                    max_retries=self.max_link_retries
                 )
 
         logger.info(f"Completed processing of run {run_name}")
@@ -282,6 +301,36 @@ class FlagFileHandler(FileSystemEventHandler):
             except Exception as e:
                 logger.error(f"Failed to upload {bam_file}: {e}")
             time.sleep(1)  # optional small pause to avoid overloading network/API
+
+    def _upload_run_root_files(self, run_dir, run_id, flag_path):
+        """Upload any file sitting directly next to the flag file (QC summaries,
+        cnv files, checksums, etc.) as run attachments, keeping their original
+        filename. Subdirectories (bam/, multiqc/, ...) are handled separately and
+        the flag file itself is skipped."""
+        root_files = sorted(
+            f for f in run_dir.iterdir()
+            if f.is_file() and f != flag_path and not f.name.endswith(self.flag_suffix)
+        )
+        logger.info(f"Found {len(root_files)} run-level files to upload")
+
+        for file_path in root_files:
+            if not self.client._is_token_valid():
+                logger.warning("Token invalid, reauthenticating before upload...")
+                self.client.authenticate()
+                self.client._save_token()
+
+            logger.info(f"Uploading run file: {file_path.name}")
+            try:
+                with open(file_path, "rb") as f:
+                    files = {"file": (file_path.name, f)}
+                    url = f"{self.client.base_url}/runs/{run_id}/files/"
+                    response = requests.post(url, files=files, headers=self.client._headers())
+                    response.raise_for_status()
+                    logger.info(f"Uploaded run file: {file_path.name}")
+            except Exception as e:
+                logger.error(f"Failed to upload {file_path}: {e}")
+
+            time.sleep(0.5)
 
     def _upload_multiqc_dir(self, multiqc_dir, run_id):
         """Upload only ZIP files within multiqc (recursively)."""
@@ -355,8 +404,15 @@ class FlagFileHandler(FileSystemEventHandler):
     # ---------------------------
     # Update BAM path
     # ---------------------------
-    def _link_bam_files_to_samples(self, run_dir, run_id, retry_delay_min=10):
-        """After upload & backup, link BAM files to existing samples by patching bamPath."""
+    def _link_bam_files_to_samples(self, run_dir, run_id, retry_delay_min=10, max_retries=3):
+        """After upload & backup, link BAM files to existing samples by patching bamPath.
+
+        The bam-uploader is expected to run after diagho-uploader has finished, so
+        every kept sample should already exist in the app. A bam with no matching
+        sample most likely belongs to a patient that was removed from the metadata
+        (e.g. low quality). Rather than blocking the whole run forever, we retry a
+        bounded number of times, then skip that bam and continue. Skipped samples
+        are reported once linking is finished."""
         bam_dir = run_dir / "bam"
         if not bam_dir.exists():
             logger.info(f"No BAM directory in {run_dir}, skipping sample linking.")
@@ -367,6 +423,7 @@ class FlagFileHandler(FileSystemEventHandler):
             logger.info("No BAM files found for sample linking.")
             return
 
+        skipped = []
         for bam_file in bam_files:
             person_id = bam_file.name.split('.')[0]
             bam_url = f"{self.client.base_url.removesuffix("/api/v1")}/media/uploads/bio_files/run/{run_id}/{bam_file.name}"
@@ -386,13 +443,26 @@ class FlagFileHandler(FileSystemEventHandler):
                         except Exception as e:
                             logger.error(f"Failed to patch sample {sid}: {e}")
                     found = True
+                elif retries >= max_retries:
+                    logger.warning(
+                        f"No sample found for {person_id} after {max_retries} retries; "
+                        f"skipping (patient likely removed from metadata)."
+                    )
+                    skipped.append(person_id)
+                    break
                 else:
                     retries += 1
                     delay = retry_delay_min * 60
-                    logger.warning(f"No samples found for {person_id}. Retry {retries} in {retry_delay_min} min...")
+                    logger.warning(f"No samples found for {person_id}. Retry {retries}/{max_retries} in {retry_delay_min} min...")
                     time.sleep(delay)
 
-            logger.info(f"BAM linking complete for {person_id}")
+            if found:
+                logger.info(f"BAM linking complete for {person_id}")
+
+        if skipped:
+            logger.warning(f"Sample linking finished. {len(skipped)} bam(s) skipped (no matching sample): {', '.join(skipped)}")
+        else:
+            logger.info("Sample linking finished. All bams linked to a sample.")
 
 
 
@@ -411,6 +481,7 @@ def main():
 
     retry_delay_min = int(config["SAMPLES"].get("retry_delay_minutes", 10))
     enable_bam_linking = config["SAMPLES"].getboolean("enable_bam_linking", True)
+    max_link_retries = int(config["SAMPLES"].get("max_link_retries", 3))
 
     client = APIClient(base_url, identifier, password)
 
@@ -423,7 +494,8 @@ def main():
         backup_root=backup_root,
         retention_days=retention_days,
         retry_delay_min=retry_delay_min,
-        enable_bam_linking=enable_bam_linking
+        enable_bam_linking=enable_bam_linking,
+        max_link_retries=max_link_retries
     )
 
     observer = Observer()
